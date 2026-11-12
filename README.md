@@ -91,6 +91,50 @@ Download only the years needed. The NOAA archive index currently lists about
 4.72 GB for all 1929–2025 yearly archives combined; the 2010–2019 subset is
 about 1.0 GB compressed. Extracted CSVs require additional disk space.
 
+### Download and build every station for a year range
+
+Set the start and end years to the range you want. These commands omit
+`--stations-file`, so every station in each yearly archive is extracted. For
+all currently archived GSOD years, use 1929 and 2025. This full run needs much
+more space than the compressed archives: NOAA's bulk output estimate is about
+40.55 GB, and the seasonal outputs need additional room. Plan for at least
+50 GB free and check available storage before starting; a full build may need
+more depending on generated windows.
+
+PowerShell:
+
+```powershell
+$StartYear = 1929
+$EndYear = 2025
+$ArchiveDir = "C:\Users\aarav\Downloads\GSOD"
+$RawDir = ".\data\global_surface\raw"
+$ProcessedDir = ".\data\global_surface\processed"
+python -m pipeline.global_surface.download_archives --start-year $StartYear --end-year $EndYear --archive-dir $ArchiveDir
+python -m pipeline.global_surface.archive inventory --archive-dir $ArchiveDir --start-year $StartYear --end-year $EndYear --output .\data\global_surface\station_inventory.csv
+python -m pipeline.global_surface.archive extract --archive-dir $ArchiveDir --start-year $StartYear --end-year $EndYear --raw-dir $RawDir
+python -m pipeline.global_surface.season_tasks --raw-dir $RawDir --output-dir $ProcessedDir --features TEMP --input-days 31 --forecast-days 7
+```
+
+Linux / SSH:
+
+```bash
+START_YEAR=1929
+END_YEAR=2025
+ARCHIVE_DIR=./data/global_surface/archives
+RAW_DIR=./data/global_surface/raw
+PROCESSED_DIR=./data/global_surface/processed
+python -m pipeline.global_surface.download_archives --start-year "$START_YEAR" --end-year "$END_YEAR" --archive-dir "$ARCHIVE_DIR"
+python -m pipeline.global_surface.archive inventory --archive-dir "$ARCHIVE_DIR" --start-year "$START_YEAR" --end-year "$END_YEAR" --output ./data/global_surface/station_inventory.csv
+python -m pipeline.global_surface.archive extract --archive-dir "$ARCHIVE_DIR" --start-year "$START_YEAR" --end-year "$END_YEAR" --raw-dir "$RAW_DIR"
+python -m pipeline.global_surface.season_tasks --raw-dir "$RAW_DIR" --output-dir "$PROCESSED_DIR" --features TEMP --input-days 31 --forecast-days 7
+```
+
+Change only `START_YEAR` and `END_YEAR` (or `$StartYear` and `$EndYear`) to
+build a different range. For selected stations, add
+`--stations-file ./pipeline/global_surface/stations.txt` to the extraction
+command. That reduces extracted CSV storage but the annual archives still
+contain every station.
+
 ## 2. Inspect station IDs available in your archive folder
 
 This writes the same inventory format as the direct NOAA index inspector:
@@ -154,6 +198,105 @@ fit it on training windows in the training stage. NPZ input arrays have shape
 `(number_of_windows, input_days, features)` and target arrays have shape
 `(number_of_windows, forecast_days, features)`. Outputs are organized as
 `processed/stations/<station_id>/` and `processed/windows/<station_id>/`.
+
+### Example output
+
+For example, a northern station might produce:
+
+```text
+data/global_surface/processed/
+├── manifest.json
+├── stations/
+│   └── 03005099999/
+│       └── 03005099999_2010_spring.csv
+└── windows/
+    └── 03005099999/
+        └── 03005099999_2010_spring.npz
+```
+
+The cleaned CSV contains one row per date plus station ID, season ID, season,
+hemisphere, station name, latitude, longitude, elevation, and the selected
+weather features. The NPZ contains arrays such as:
+
+```text
+train_x: (N_train, 31, 1)   # 31 daily TEMP inputs, Fahrenheit
+train_y: (N_train,  7, 1)   # next 7 daily TEMP targets
+test_x:  (N_test,  31, 1)
+test_y:  (N_test,   7, 1)
+features: ['TEMP']
+station_id: '03005099999'
+season: 'spring'
+season_start: '2010-03-01'
+season_end: '2010-05-31'
+```
+
+`N_train` and `N_test` depend on valid, non-missing windows in that station's
+season; the example shapes and station are illustrative.
+
+## Using these tasks for federated continual learning
+
+The intended mapping is:
+
+| Prepared data | Federated continual learning role |
+|---|---|
+| One station ID | One federated client |
+| One season NPZ for a station | That client's task for that seasonal time step |
+| Seasons ordered by `season_start` | Continual sequence / communication rounds |
+| `train_x`, `train_y` | Local client training data for that task |
+| `test_x`, `test_y` | Held-out evaluation for that task |
+| A station/season in the manifest marked skipped | Client has no training task for that time step |
+
+At training time, group NPZ files by their season start, sort those starts
+chronologically, and pass each season's training windows to the matching
+station client. Convert each array batch to tensors; for the default univariate
+configuration the model input length is 31 and forecast length is 7. Keep each
+client's model and replay memory between seasons. Evaluate on that season's
+test arrays after training, before moving to the next season. Do not use test
+arrays for optimization or replay.
+
+In the continual trainer's expected structure, one round is a list of client
+batch lists:
+
+```python
+round_batches[round_index][client_index] = [
+    (input_tensor_batch, target_tensor_batch),
+    ...,
+]
+```
+
+For example, a training-side adapter can read and batch one task's training
+windows like this:
+
+```python
+import numpy as np
+import torch
+
+
+def load_training_batches(npz_path, batch_size=32):
+    with np.load(npz_path, allow_pickle=False) as task:
+        inputs = task['train_x']
+        targets = task['train_y']
+    return [
+        (torch.from_numpy(inputs[start:start + batch_size]),
+         torch.from_numpy(targets[start:start + batch_size]))
+        for start in range(0, len(inputs), batch_size)
+    ]
+```
+
+Use `test_x` and `test_y` only in a separate evaluation pass. In a full
+training implementation, build the season rounds by grouping station NPZs with
+the same `season_start` and sort the groups by date.
+
+The NPZ files do not directly plug into the Electricity CSV runner. A training
+adapter must load each NPZ, batch its training arrays, and assemble this
+structure. Also, stations may be skipped for individual seasons by design.
+The current `ContinualFedMixer` implementation expects every client in every
+round and does not safely handle an inactive client during aggregation. Before
+training a set with skipped station/season tasks, the trainer must support an
+active-client mask and exclude inactive clients from that round's aggregation;
+do not replace missing tasks with zero-valued data. If every selected station
+has a task in every round, ordinary all-client rounds can be assembled without
+that change.
 
 ## Existing direct station download
 
